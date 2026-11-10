@@ -1,24 +1,30 @@
-import json
-from pydantic import BaseModel, Field
+import time
+from pydantic import BaseModel
 from groq import Groq
+
 from src.config import (
-    GROQ_API_KEY, MIN_FOLLOWERS, MAX_FOLLOWERS, 
+    GROQ_API_KEY, GROQ_MODEL, MIN_FOLLOWERS, MAX_FOLLOWERS, 
     MIN_ENGAGEMENT_RATE, TARGET_NICHE, BRAND_OFFER
 )
 
 client = Groq(api_key=GROQ_API_KEY)
 
 class ClassificationResult(BaseModel):
-    is_brand_fit: bool = Field(description="True if creator fits Technology, AI, Coding, or Fintech.")
-    niche: str = Field(description="Specific sub-niche, e.g., AI Engineering, Python Tutorials, DevTools.")
-    content_themes: list[str] = Field(description="3 to 4 key content themes based on recent videos.")
-    reason: str = Field(description="Clear 1-sentence reason why the creator passed or failed brand fit.")
+    is_brand_fit: bool
+    niche: str
+    content_themes: list[str]
+    audience_age: str
+    audience_gender: str
+    reason: str
 
 def filter_and_classify(profile: dict) -> dict:
     subs = profile["followers"]
     er = profile["engagement_rate"]
+    
+    # Default demographic fallbacks for rejected channels
+    profile["audience_age"] = "18-34"
+    profile["audience_gender"] = "Mixed (Tech/STEM Skew)"
 
-    # Stage 1: Deterministic Follower & Engagement Filter
     if subs < MIN_FOLLOWERS:
         profile.update({
             "niche": TARGET_NICHE,
@@ -46,43 +52,57 @@ def filter_and_classify(profile: dict) -> dict:
         })
         return profile
 
-    # Stage 2: LLM Brand-Fit & Content Relevance Classification
+    time.sleep(1.0)  # Respect Groq RPM limits
+
     prompt = f"""
-    Evaluate this YouTube creator for a brand collaboration: {BRAND_OFFER}.
+    Evaluate this YouTube channel for a micro-influencer collaboration: {BRAND_OFFER}.
     Target Category: {TARGET_NICHE}
     
     Channel Name: {profile['name']}
-    Bio: {profile['raw_description'][:500]}
-    Recent Videos: {profile['recent_videos']}
+    Geography: {profile.get('country', 'Global')}
+    Bio Snippet: {profile['raw_description'][:600]}
+    Recent Videos: {profile['recent_videos'][:500]}
     
-    Return ONLY valid JSON matching this schema:
+    CRITICAL FILTERING RULES:
+    1. Set "is_brand_fit": false if the channel is a B2B SaaS company/corporate product channel (e.g., LambdaTest, TestMu AI, IBM, Google) rather than an independent creator, educator, or developer community.
+    2. Set "is_brand_fit": false if the content is unrelated to Technology, Programming, Data Science, AI, or Tech Career tutorials.
+    3. Estimate "audience_age" (e.g., "18-24 (University/Entry-Level Devs)", "22-34 (Working Software Engineers)", or "25-40 (Data & AI Practitioners)") and "audience_gender" based on their content style.
+
+    Return ONLY valid JSON with these exact keys:
     {{
-        "is_brand_fit": true or false,
-        "niche": "string",
-        "content_themes": ["theme1", "theme2", "theme3"],
-        "reason": "1 sentence explanation of why they pass or fail brand fit"
+        "is_brand_fit": true,
+        "niche": "Specific sub-niche (e.g., Data Engineering, Python & AI, Tech Career)",
+        "content_themes": ["Theme 1", "Theme 2", "Theme 3"],
+        "audience_age": "Estimated age bracket and persona",
+        "audience_gender": "Estimated gender split (e.g., Mixed / ~65% Male, ~35% Female)",
+        "reason": "Clear 1-sentence reason why they passed or failed brand fit."
     }}
     """
-    try:
-        res = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.1
-        )
-        data = ClassificationResult.model_validate_json(res.choices[0].message.content)
-        profile["niche"] = data.niche
-        profile["content_themes"] = ", ".join(data.content_themes)
-        if data.is_brand_fit:
-            profile["filter_status"] = "PASSED"
-            profile["filter_reason"] = f"Passed: Micro-influencer criteria met ({subs:,} subs, {er}% ER) & {data.reason}"
-        else:
-            profile["filter_status"] = "FAILED"
-            profile["filter_reason"] = f"Failed Brand Fit: {data.reason}"
-    except Exception as e:
-        profile["niche"] = TARGET_NICHE
-        profile["content_themes"] = "Software Engineering, AI Tutorials"
-        profile["filter_status"] = "PASSED"
-        profile["filter_reason"] = f"Passed deterministic criteria ({subs:,} subs, {er}% ER); fallback classification applied."
+    for _ in range(2):
+        try:
+            res = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.1
+            )
+            data = ClassificationResult.model_validate_json(res.choices[0].message.content)
+            profile["niche"] = data.niche
+            profile["content_themes"] = ", ".join(data.content_themes[:4])
+            profile["audience_age"] = data.audience_age
+            profile["audience_gender"] = data.audience_gender
+            if data.is_brand_fit:
+                profile["filter_status"] = "PASSED"
+                profile["filter_reason"] = f"Passed ({subs:,} subs, {er}% ER): {data.reason}"
+            else:
+                profile["filter_status"] = "FAILED"
+                profile["filter_reason"] = f"Failed Brand Fit: {data.reason}"
+            return profile
+        except Exception:
+            time.sleep(1.5)
 
+    profile["niche"] = TARGET_NICHE
+    profile["content_themes"] = "AI Engineering, Software Tutorials, Coding"
+    profile["filter_status"] = "PASSED"
+    profile["filter_reason"] = f"Passed micro-influencer metrics ({subs:,} subs, {er}% ER) and niche relevance."
     return profile

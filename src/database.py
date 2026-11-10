@@ -57,7 +57,7 @@ def init_db():
 def export_datasets_to_csv():
     conn = get_connection()
     
-    # 1. Expected Output B: Influencer Dataset (50+ profiles, Passed & Failed)
+    # 1. Expected Output B: Influencer Dataset (All 8 Mandatory + 5 Optional Fields + Filter Reasons)
     df_inf = pd.read_sql_query("""
         SELECT 
             name AS "Name",
@@ -68,8 +68,10 @@ def export_datasets_to_csv():
             contact_email AS "Email",
             profile_url AS "Profile URL",
             content_themes AS "Content Theme",
-            instagram_url AS "Instagram",
+            instagram_url AS "Instagram / TikTok",
             website_url AS "Website",
+            audience_age AS "Audience Age",
+            audience_gender AS "Audience Gender",
             audience_geography AS "Audience Geography",
             filter_status AS "Status",
             filter_reason AS "Filter Reason"
@@ -103,4 +105,21 @@ def export_datasets_to_csv():
         FROM outreach_tracker
     """, conn)
     df_track.to_csv("data/outreach_tracker.csv", index=False)
+
+    # 4. Section 5 Requirement: Simulated / Manual Instagram DM Sending Queue
+    df_ig = pd.read_sql_query("""
+        SELECT 
+            t.influencer_name AS "Influencer",
+            i.profile_url AS "Creator Channel URL",
+            i.instagram_url AS "Instagram / Social Handle",
+            t.instagram_dm AS "Generated Instagram DM (15-30w)",
+            t.dm_word_count AS "Word Count",
+            CASE 
+                WHEN i.instagram_url != 'Not Found' THEN 'READY_FOR_MANUAL_IG_DISPATCH'
+                ELSE 'SIMULATED_CREATOR_DM_QUEUED'
+            END AS "DM Workflow Status"
+        FROM outreach_tracker t
+        JOIN influencers i ON t.channel_id = i.channel_id
+    """, conn)
+    df_ig.to_csv("data/instagram_dm_workflow.csv", index=False)
     conn.close()

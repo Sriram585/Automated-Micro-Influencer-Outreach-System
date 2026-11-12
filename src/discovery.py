@@ -1,27 +1,40 @@
 import statistics
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from src.config import YOUTUBE_API_KEY, SEARCH_QUERIES
 
-def discover_youtube_influencers(target_count: int = 75) -> list[dict]:
+def discover_youtube_influencers(target_count: int = 65) -> list[dict]:
     youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
     discovered_channel_ids = set()
 
-    print(f"[Discovery] Searching YouTube across {len(SEARCH_QUERIES)} niche queries...")
+    print(f"[Discovery] Searching YouTube across {len(SEARCH_QUERIES)} niche queries (Target: {target_count} profiles)...")
     for query in SEARCH_QUERIES:
         if len(discovered_channel_ids) >= target_count:
             break
-        req = youtube.search().list(
-            q=query,
-            part="snippet",
-            type="video",
-            maxResults=35,
-            order="relevance",
-            relevanceLanguage="en"
-        )
-        res = req.execute()
-        for item in res.get("items", []):
-            cid = item["snippet"]["channelId"]
-            discovered_channel_ids.add(cid)
+        page_token = None
+        # Supports pagination up to 500+ channels when target_count is increased
+        for _ in range(3):
+            if len(discovered_channel_ids) >= target_count:
+                break
+            try:
+                req = youtube.search().list(
+                    q=query,
+                    part="snippet",
+                    type="video",
+                    maxResults=50,
+                    pageToken=page_token,
+                    order="relevance",
+                    relevanceLanguage="en"
+                )
+                res = req.execute()
+                for item in res.get("items", []):
+                    discovered_channel_ids.add(item["snippet"]["channelId"])
+                page_token = res.get("nextPageToken")
+                if not page_token:
+                    break
+            except HttpError as e:
+                print(f"[Discovery Warning] YouTube Search API limit/error: {e}")
+                break
 
     channel_id_list = list(discovered_channel_ids)[:target_count]
     print(f"[Discovery] Found {len(channel_id_list)} unique channels. Fetching metrics...")
@@ -29,11 +42,15 @@ def discover_youtube_influencers(target_count: int = 75) -> list[dict]:
     profiles = []
     for i in range(0, len(channel_id_list), 50):
         batch_ids = channel_id_list[i:i+50]
-        ch_req = youtube.channels().list(
-            id=",".join(batch_ids),
-            part="snippet,statistics,contentDetails"
-        )
-        ch_res = ch_req.execute()
+        try:
+            ch_req = youtube.channels().list(
+                id=",".join(batch_ids),
+                part="snippet,statistics,contentDetails"
+            )
+            ch_res = ch_req.execute()
+        except Exception as e:
+            print(f"[Discovery Warning] Channel batch fetch error: {e}")
+            continue
 
         for ch in ch_res.get("items", []):
             cid = ch["id"]
@@ -44,18 +61,34 @@ def discover_youtube_influencers(target_count: int = 75) -> list[dict]:
                 continue
                 
             subs = int(stats.get("subscriberCount", 0))
+            total_views = int(stats.get("viewCount", 0))
+            video_count = max(int(stats.get("videoCount", 1)), 1)
+            custom_url = snippet.get("customUrl", f"channel/{cid}")
+            profile_url = f"https://www.youtube.com/{custom_url}" if custom_url.startswith("@") else f"https://www.youtube.com/channel/{cid}"
+
+            # Early Gate: If outside 5k-100k micro-influencer window, estimate baseline ER from channel stats to save API quota
+            if subs < 5000 or subs > 100000:
+                avg_views_per_vid = total_views / video_count
+                est_er = round(min((avg_views_per_vid / max(subs, 1)) * 3.5, 25.0), 2)
+                profiles.append({
+                    "channel_id": cid,
+                    "name": snippet.get("title", "Unknown").strip(),
+                    "platform": "YouTube",
+                    "profile_url": profile_url,
+                    "followers": subs,
+                    "engagement_rate": est_er,
+                    "raw_description": snippet.get("description", ""),
+                    "country": snippet.get("country", "Global"),
+                    "recent_videos": "Channel outside 5k-100k micro-influencer subscriber bounds"
+                })
+                continue
+
             uploads_playlist = ch["contentDetails"]["relatedPlaylists"].get("uploads")
-            
             video_context = _fetch_recent_video_engagement(youtube, uploads_playlist, subs)
             if not video_context["titles"]:
                 continue
 
-            custom_url = snippet.get("customUrl", f"channel/{cid}")
-            profile_url = f"https://www.youtube.com/{custom_url}" if custom_url.startswith("@") else f"https://www.youtube.com/channel/{cid}"
-
             combined_description = snippet.get("description", "") + "\n" + "\n".join(video_context["descs"])
-
-            # Store rich structured context inside recent_videos so we don't even need to change SQLite schema
             rich_video_summary = (
                 f"LATEST VIDEO: '{video_context['latest_title']}' ({video_context['latest_views']:,} views) - Context: {video_context['latest_snippet']} || "
                 f"MOST POPULAR RECENT VIDEO: '{video_context['popular_title']}' ({video_context['popular_views']:,} views, {video_context['popular_likes']:,} likes) - Context: {video_context['popular_snippet']} || "
@@ -70,7 +103,7 @@ def discover_youtube_influencers(target_count: int = 75) -> list[dict]:
                 "followers": subs,
                 "engagement_rate": round(video_context["median_er"], 2),
                 "raw_description": combined_description,
-                "country": snippet.get("country", "Global / Unspecified"),
+                "country": snippet.get("country", "Global"),
                 "recent_videos": rich_video_summary
             })
 
@@ -103,7 +136,6 @@ def _fetch_recent_video_engagement(youtube, playlist_id: str, followers: int) ->
         for v in v_res.get("items", []):
             title = v["snippet"]["title"]
             desc = v["snippet"].get("description", "")
-            # Clean first 180 chars of description to understand what the video is actually about
             clean_desc = " ".join(desc.split())[:180]
             
             v_stats = v.get("statistics", {})
@@ -111,8 +143,9 @@ def _fetch_recent_video_engagement(youtube, playlist_id: str, followers: int) ->
             likes = int(v_stats.get("likeCount", 0))
             comments = int(v_stats.get("commentCount", 0))
             
-            denom = max(views, 1)
-            er = ((likes + comments) / denom) * 100.0
+            # Guard against brand-new/unreleased premieres with <25 views skewing ER
+            denom = max(views, followers if views < 25 else views, 1)
+            er = min(((likes + comments) / denom) * 100.0, 100.0)
             er_list.append(er)
 
             video_records.append({

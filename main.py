@@ -1,3 +1,6 @@
+import argparse
+import os
+from src.config import YOUTUBE_API_KEY, GROQ_API_KEY, DB_PATH
 from src.database import init_db, get_connection, export_datasets_to_csv
 from src.discovery import discover_youtube_influencers
 from src.enrichment import enrich_influencer_profile
@@ -5,18 +8,44 @@ from src.filter import filter_and_classify
 from src.personalizer import generate_personalized_messages
 from src.sender import process_outreach_sending
 
-def run_pipeline():
+def run_pipeline(target_count: int = 65, force_refresh: bool = False):
     print("=== Automated Micro-Influencer Outreach Pipeline ===")
     init_db()
-    
-    # 1. Discovery (Fetch 65+ profiles to ensure >50 clean records)
-    raw_profiles = discover_youtube_influencers(target_count=65)
-    
+
+    # Graceful offline/evaluator fallback if API keys are missing
+    if not YOUTUBE_API_KEY or not GROQ_API_KEY:
+        if os.path.exists(DB_PATH):
+            print("[Offline Mode] API keys not detected in .env. Exporting existing SQLite dataset to CSV...")
+            export_datasets_to_csv()
+            print("Done! Launch `streamlit run app.py` to inspect the pre-populated pipeline.")
+            return
+        raise RuntimeError("Missing YOUTUBE_API_KEY or GROQ_API_KEY in .env and no cached database found.")
+
+    raw_profiles = discover_youtube_influencers(target_count=target_count)
     conn = get_connection()
     cursor = conn.cursor()
 
     passed_count = 0
+    skipped_cached = 0
+
     for idx, prof in enumerate(raw_profiles, 1):
+        cid = prof["channel_id"]
+
+        # True Automation & Idempotency: Skip expensive scraping & LLM calls if already processed
+        if not force_refresh:
+            cursor.execute(
+                "SELECT i.filter_status, i.contact_email, t.status FROM influencers i "
+                "LEFT JOIN outreach_tracker t ON i.channel_id = t.channel_id WHERE i.channel_id = ?",
+                (cid,)
+            )
+            existing = cursor.fetchone()
+            if existing and (existing["filter_status"] == "FAILED" or existing["status"] is not None):
+                skipped_cached += 1
+                if existing["filter_status"] == "PASSED":
+                    passed_count += 1
+                print(f"[{idx}/{len(raw_profiles)}] SKIPPED (Already Processed): {prof['name']} -> {existing['filter_status']}")
+                continue
+
         print(f"[{idx}/{len(raw_profiles)}] Processing: {prof['name']} ({prof['followers']:,} subs)...")
         
         # 2. Filtering & Classification
@@ -55,8 +84,12 @@ def run_pipeline():
     conn.close()
     export_datasets_to_csv()
     print("\n=== Pipeline Complete! ===")
-    print(f"Total Discovered: {len(raw_profiles)} | Shortlisted (Passed): {passed_count}")
-    print("Exported files to /data: influencers_dataset.csv, personalized_messages.csv, outreach_tracker.csv")
+    print(f"Total Discovered: {len(raw_profiles)} | Shortlisted (Passed): {passed_count} | Cached Skips: {skipped_cached}")
+    print("Exported files to /data: influencers_dataset.csv, personalized_messages.csv, outreach_tracker.csv, instagram_dm_workflow.csv")
 
 if __name__ == "__main__":
-    run_pipeline()
+    parser = argparse.ArgumentParser(description="EDXSO Automated Micro-Influencer Outreach Pipeline")
+    parser.add_argument("--target", type=int, default=65, help="Target number of influencers to discover (e.g., 65 or 500)")
+    parser.add_argument("--force-refresh", action="store_true", help="Re-process channels even if already in SQLite")
+    args = parser.parse_args()
+    run_pipeline(target_count=args.target, force_refresh=args.force_refresh)

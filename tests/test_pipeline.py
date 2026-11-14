@@ -4,7 +4,7 @@ from src.personalizer import _surgical_word_bound_enforcer, count_words
 def test_email_extraction_and_false_positives():
     assert extract_valid_email("Contact me at hello [at] creator [dot] io for collabs") == "hello@creator.io"
     assert extract_valid_email("Install via npm i react@18.2.0 or image@2x.png") == "Not Found"
-
+    assert extract_valid_email("35c3cc890abe9dbb51e6e513fcd6bbca@o922922.ingest.us.sentry.io") == "Not Found"
 def test_word_count_bounds_enforcer():
     short_text = "Hi Alex, loved your video on Python agents. Best, NexusAI Team"
     enforced_email = _surgical_word_bound_enforcer(short_text, 64, 86, "Best, NexusAI Team")

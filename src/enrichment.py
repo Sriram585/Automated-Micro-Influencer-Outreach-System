@@ -30,9 +30,14 @@ def extract_valid_email(text: str) -> str:
         candidate = candidate.strip(".,;:)'\"/\\").lower()
         if candidate.endswith(IGNORED_EXTENSIONS) or len(candidate) > 60:
             continue
-        domain = candidate.split("@")[-1]
+        local_part, domain = candidate.split("@", 1)
         tld = domain.split(".")[-1]
-        if domain not in IGNORED_EMAIL_DOMAINS and tld in VALID_TLDS:
+        
+        # Reject subdomain telemetry (e.g., *.sentry.io) and 24+ char hex crash-reporting keys
+        is_ignored_domain = any(domain == d or domain.endswith("." + d) for d in IGNORED_EMAIL_DOMAINS)
+        is_hex_hash = len(local_part) >= 24 and all(c in "0123456789abcdef" for c in local_part)
+        
+        if not is_ignored_domain and not is_hex_hash and tld in VALID_TLDS:
             return candidate
     return "Not Found"
 

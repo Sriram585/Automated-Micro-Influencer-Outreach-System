@@ -3,7 +3,10 @@ from dotenv import load_dotenv
 from groq import Groq
 
 load_dotenv()
-
+def get_active_groq_model() -> str:
+    """Dynamically selects the best available LLM on the user's Groq API key."""
+    if not GROQ_API_KEY or GROQ_API_KEY.startswith("your_"):
+        return "openai/gpt-oss-120b"
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 SEND_MODE = os.getenv("SEND_MODE", "SIMULATE")  # "SIMULATE" or "LIVE_SMTP"
